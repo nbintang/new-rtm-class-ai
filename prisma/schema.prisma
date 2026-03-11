@@ -1,0 +1,435 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  TEACHER
+  STUDENT
+}
+
+enum OtpPurpose {
+  PASSWORD_RESET
+}
+
+enum ClassroomMemberRole {
+  TEACHER
+  STUDENT
+}
+
+enum MaterialStatus {
+  UPLOADED
+  PROCESSING
+  READY
+  ARCHIVED
+}
+
+enum AIJobType {
+  MCQ
+  ESSAY
+  SUMMARY
+  LKPD
+  REMEDIAL
+  DISCUSSION_TOPIC
+}
+
+enum AIJobStatus {
+  accepted
+  processing
+  succeeded
+  failed_processing
+  failed_delivery
+}
+
+enum AssignmentType {
+  QUIZ_MCQ
+  QUIZ_ESSAY
+  TASK
+  REMEDIAL
+}
+
+enum AssignmentStatus {
+  DRAFT
+  PUBLISHED
+  CLOSED
+}
+
+enum SubmissionStatus {
+  SUBMITTED
+  GRADED
+}
+
+enum AssignmentQuestionType {
+  MCQ
+  ESSAY
+  TASK
+  REMEDIAL
+  GENERIC
+}
+
+model User {
+  id            String         @id @default(uuid())
+  fullName      String
+  email         String         @unique
+  passwordHash  String
+  role          UserRole       @default(STUDENT)
+  isSuspended   Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  profile       Profile?
+  blogPosts     BlogPost[]
+  otpCodes      Otp[]
+  refreshTokens RefreshToken[]
+  taughtClasses Classroom[]         @relation("ClassTeacher")
+  classMembers  ClassroomMember[]
+  forumThreads  ForumThread[]
+  forumComments ForumComment[]
+  threadVotes   ForumThreadUpvote[]
+  commentVotes  ForumCommentUpvote[]
+  uploadedMaterials Material[]
+  aiJobsRequested   AiJob[]
+  assignmentsCreated Assignment[]          @relation("AssignmentCreator")
+  submissions        AssignmentSubmission[] @relation("SubmissionStudent")
+  gradedSubmissions  AssignmentSubmission[] @relation("SubmissionGrader")
+  gradedQuestionGrades AssignmentQuestionGrade[] @relation("QuestionGradeGrader")
+  blogComments       BlogComment[]
+}
+
+model Profile {
+  id          String   @id @default(uuid())
+  userId       String   @unique
+  address      String?
+  phoneNumber  String?
+  pictureUrl   String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model BlogPost {
+  id          String   @id @default(uuid())
+  title       String
+  slug        String   @unique
+  excerpt     String?
+  content     String
+  isPublished Boolean  @default(false)
+  publishedAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  authorId    String
+  author      User     @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  comments    BlogComment[]
+
+  @@index([isPublished, publishedAt])
+}
+
+model BlogComment {
+  id        String        @id @default(uuid())
+  postId    String
+  authorId  String
+  parentId  String?
+  content   String
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  post      BlogPost      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author    User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parent    BlogComment?  @relation("BlogCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   BlogComment[] @relation("BlogCommentReplies")
+
+  @@index([postId, createdAt])
+  @@index([authorId])
+  @@index([parentId])
+}
+
+model Otp {
+  id         String     @id @default(uuid())
+  purpose    OtpPurpose
+  codeHash   String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime   @default(now())
+  userId     String
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  tokenHash  String
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime @default(now())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Classroom {
+  id              String            @id @default(uuid())
+  name            String
+  classCode       String            @unique
+  institutionName String?
+  classLevel      String?
+  academicYear    String?
+  description     String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  teacherId       String
+  teacher         User              @relation("ClassTeacher", fields: [teacherId], references: [id], onDelete: Restrict)
+  members         ClassroomMember[]
+  forumThreads    ForumThread[]
+  materials       Material[]
+  assignments     Assignment[]
+
+  @@index([teacherId])
+  @@index([createdAt])
+}
+
+model Assignment {
+  id           String               @id @default(uuid())
+  classroomId  String
+  materialId   String?
+  createdById  String
+  title        String
+  description  String?
+  type         AssignmentType
+  status       AssignmentStatus     @default(DRAFT)
+  content      Json?
+  passingScore Int                  @default(70)
+  maxScore     Int                  @default(100)
+  dueAt        DateTime?
+  publishedAt  DateTime?
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  classroom    Classroom            @relation(fields: [classroomId], references: [id], onDelete: Cascade)
+  material     Material?            @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  createdBy    User                 @relation("AssignmentCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  submissions  AssignmentSubmission[]
+
+  @@index([classroomId, status, createdAt])
+  @@index([createdById])
+  @@index([materialId])
+}
+
+model Material {
+  id            String       @id @default(uuid())
+  classroomId   String
+  uploadedById  String
+  title         String
+  description   String?
+  fileUrl       String
+  fileMimeType  String?
+  status        MaterialStatus @default(UPLOADED)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  classroom     Classroom    @relation(fields: [classroomId], references: [id], onDelete: Cascade)
+  uploadedBy    User         @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+  aiJobs        AiJob[]
+  aiOutputs     AiOutput[]
+  assignments   Assignment[]
+
+  @@index([classroomId, createdAt])
+  @@index([uploadedById])
+}
+
+model AiJob {
+  id            String      @id @default(uuid())
+  materialId    String
+  requestedById String
+  type          AIJobType
+  status        AIJobStatus @default(accepted)
+  attempts      Int         @default(0)
+  parameters    Json?
+  externalJobId String?
+  lastError     String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  startedAt     DateTime?
+  completedAt   DateTime?
+  material      Material    @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  requestedBy   User        @relation(fields: [requestedById], references: [id], onDelete: Restrict)
+  output        AiOutput?
+
+  @@index([status, createdAt])
+  @@index([materialId])
+  @@index([requestedById])
+  @@map("AIJob")
+}
+
+model AiOutput {
+  id           String    @id @default(uuid())
+  materialId   String
+  jobId        String    @unique
+  type         AIJobType
+  content      Json
+  editedContent Json?
+  isPublished  Boolean   @default(false)
+  publishedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  material     Material  @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  job          AiJob     @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([materialId, type])
+  @@map("AIOutput")
+}
+
+model ClassroomMember {
+  id          String             @id @default(uuid())
+  classroomId String
+  userId      String
+  role        ClassroomMemberRole
+  createdAt   DateTime           @default(now())
+  classroom   Classroom          @relation(fields: [classroomId], references: [id], onDelete: Cascade)
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([classroomId, userId])
+  @@index([userId])
+}
+
+model AssignmentSubmission {
+  id          String           @id @default(uuid())
+  assignmentId String
+  studentId    String
+  answers      Json?
+  status       SubmissionStatus @default(SUBMITTED)
+  score        Float?
+  feedback     String?
+  gradedById   String?
+  submittedAt  DateTime         @default(now())
+  gradedAt     DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  assignment   Assignment       @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  student      User             @relation("SubmissionStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  gradedBy     User?            @relation("SubmissionGrader", fields: [gradedById], references: [id], onDelete: SetNull)
+  attempts     AssignmentSubmissionAttempt[]
+  attachments  AssignmentSubmissionAttachment[]
+  questionGrades AssignmentQuestionGrade[]
+
+  @@unique([assignmentId, studentId])
+  @@index([studentId, submittedAt])
+  @@index([assignmentId, status])
+}
+
+model AssignmentSubmissionAttempt {
+  id            String              @id @default(uuid())
+  submissionId  String
+  attemptNumber Int
+  answers       Json?
+  status        SubmissionStatus    @default(SUBMITTED)
+  score         Float?
+  feedback      String?
+  submittedAt   DateTime            @default(now())
+  createdAt     DateTime            @default(now())
+  submission    AssignmentSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  attachments   AssignmentSubmissionAttachment[]
+  questionGrades AssignmentQuestionGrade[]
+
+  @@unique([submissionId, attemptNumber])
+  @@index([submissionId, submittedAt])
+}
+
+model AssignmentSubmissionAttachment {
+  id          String                     @id @default(uuid())
+  submissionId String
+  attemptId    String?
+  fileUrl      String
+  fileName     String?
+  fileMimeType String?
+  createdAt    DateTime                  @default(now())
+  submission   AssignmentSubmission      @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  attempt      AssignmentSubmissionAttempt? @relation(fields: [attemptId], references: [id], onDelete: SetNull)
+
+  @@index([submissionId])
+  @@index([attemptId])
+}
+
+model AssignmentQuestionGrade {
+  id           String                     @id @default(uuid())
+  submissionId String
+  attemptId    String?
+  questionId   String
+  questionType AssignmentQuestionType
+  score        Float
+  maxScore     Float
+  isCorrect    Boolean?
+  feedback     String?
+  gradedById   String?
+  gradedAt     DateTime                   @default(now())
+  createdAt    DateTime                   @default(now())
+  submission   AssignmentSubmission       @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  attempt      AssignmentSubmissionAttempt? @relation(fields: [attemptId], references: [id], onDelete: SetNull)
+  gradedBy     User?                      @relation("QuestionGradeGrader", fields: [gradedById], references: [id], onDelete: SetNull)
+
+  @@index([submissionId, questionId])
+  @@index([attemptId])
+  @@index([gradedById])
+}
+
+model ForumThread {
+  id          String            @id @default(uuid())
+  classroomId String
+  authorId    String
+  title       String
+  content     String
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  classroom   Classroom         @relation(fields: [classroomId], references: [id], onDelete: Cascade)
+  author      User              @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments    ForumComment[]
+  upvotes     ForumThreadUpvote[]
+
+  @@index([classroomId, createdAt])
+  @@index([authorId])
+}
+
+model ForumComment {
+  id        String              @id @default(uuid())
+  threadId  String
+  authorId  String
+  parentId  String?
+  content   String
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+  thread    ForumThread         @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  author    User                @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parent    ForumComment?       @relation("ForumCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   ForumComment[]      @relation("ForumCommentReplies")
+  upvotes   ForumCommentUpvote[]
+
+  @@index([threadId, createdAt])
+  @@index([authorId])
+  @@index([parentId])
+}
+
+model ForumThreadUpvote {
+  id        String      @id @default(uuid())
+  threadId  String
+  userId    String
+  createdAt DateTime    @default(now())
+  thread    ForumThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([threadId, userId])
+  @@index([userId])
+}
+
+model ForumCommentUpvote {
+  id        String       @id @default(uuid())
+  commentId String
+  userId    String
+  createdAt DateTime     @default(now())
+  comment   ForumComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([commentId, userId])
+  @@index([userId])
+}
