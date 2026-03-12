@@ -383,6 +383,13 @@ export class AiService implements OnModuleInit {
 
     if (isPdf) {
       try {
+        // Polyfill untuk lingkungan server (deployment) agar pdf-parse tidak error
+        if (typeof global !== 'undefined') {
+          (global as any).DOMMatrix = (global as any).DOMMatrix || class DOMMatrix {};
+          (global as any).ImageData = (global as any).ImageData || class ImageData {};
+          (global as any).Path2D = (global as any).Path2D || class Path2D {};
+        }
+
         const { PDFParse } = require('pdf-parse');
         
         if (typeof PDFParse === 'function') {
