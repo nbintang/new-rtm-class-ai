@@ -7,7 +7,17 @@ import { AIJobStatus, Prisma } from '@prisma/client';
 import * as pdf from 'pdf-parse';
 import { z } from 'zod';
 import { PrismaService } from '../prisma/prisma.service';
-import { GENERATION_PROMPT, SYSTEM_PROMPT } from './prompts/ai.prompts';
+import {
+  ESSAY_SCHEMA_INSTRUCTION,
+  ESSAY_TASK_INSTRUCTIONS,
+  GENERATION_PROMPT,
+  MCQ_SCHEMA_INSTRUCTION,
+  MCQ_TASK_INSTRUCTIONS,
+  REPAIR_PROMPT_TEMPLATE,
+  SUMMARY_SCHEMA_INSTRUCTION,
+  SUMMARY_TASK_INSTRUCTIONS,
+  SYSTEM_PROMPT,
+} from './prompts/ai.prompts';
 
 type AIOutputType = 'MCQ' | 'ESSAY' | 'SUMMARY';
 
@@ -194,7 +204,7 @@ export class AiService implements OnModuleInit {
           break;
         }
 
-        currentPrompt = this.buildRepairPrompt(
+        currentPrompt = await this.buildRepairPrompt(
           type,
           lastRawText,
           lastErrorMessage,
@@ -215,7 +225,7 @@ export class AiService implements OnModuleInit {
     questionCount = this.resolveCount(options.count, 5),
   ): Promise<string> {
     const maxWords = this.resolveMaxWords(options.maxWords, 200);
-    const taskInstructions = this.buildTaskInstructions(
+    const taskInstructions = await this.buildTaskInstructions(
       type,
       questionCount,
       maxWords,
@@ -232,36 +242,26 @@ export class AiService implements OnModuleInit {
     });
   }
 
-  private buildTaskInstructions(
+  private async buildTaskInstructions(
     type: AIOutputType,
     questionCount: number,
     maxWords: number,
   ) {
     if (type === 'MCQ') {
-      return [
-        `Buat ${questionCount} soal pilihan ganda berdasarkan materi.`,
-        'Gunakan struktur: { "questions": [{ "id": "q1", "text": "...", "options": ["...", "...", "...", "..."], "answer": "A" }] }.',
-        'Setiap soal harus memiliki satu jawaban benar yang jelas.',
-        'Opsi jawaban harus singkat, tidak duplikat, dan tidak semuanya benar.',
-        'Jangan hasilkan field lain di level atas selain "questions".',
-      ].join(' ');
+      return await PromptTemplate.fromTemplate(MCQ_TASK_INSTRUCTIONS).format({
+        count: questionCount,
+      });
     }
 
     if (type === 'ESSAY') {
-      return [
-        `Buat ${questionCount} soal essay berdasarkan materi.`,
-        'Gunakan struktur: { "questions": [{ "id": "q1", "text": "...", "rubric": "..." }] }.',
-        'Rubrik harus ringkas dan langsung bisa dipakai guru untuk menilai jawaban.',
-        'Jangan hasilkan field lain di level atas selain "questions".',
-      ].join(' ');
+      return await PromptTemplate.fromTemplate(ESSAY_TASK_INSTRUCTIONS).format({
+        count: questionCount,
+      });
     }
 
-    return [
-      `Buat ringkasan materi maksimal ${maxWords} kata.`,
-      'Gunakan struktur: { "summary": "..." }.',
-      'Fokus pada inti konsep, tujuan, dan poin penting materi.',
-      'Jangan hasilkan field lain di level atas selain "summary".',
-    ].join(' ');
+    return await PromptTemplate.fromTemplate(SUMMARY_TASK_INSTRUCTIONS).format({
+      maxWords,
+    });
   }
 
   private async invokeJsonObject(
@@ -283,41 +283,46 @@ export class AiService implements OnModuleInit {
     }
   }
 
-  private buildRepairPrompt(
+  private async buildRepairPrompt(
     type: AIOutputType,
     rawText: string,
     validationError: string,
     expectedQuestionCount?: number,
   ) {
-    return [
-      `Perbaiki JSON berikut agar valid untuk output ${type}.`,
-      'Jawaban WAJIB berupa JSON valid saja.',
-      `Kesalahan validasi sebelumnya: ${validationError}.`,
-      `JSON sebelumnya: ${rawText || '{}'}.`,
-      `Struktur yang wajib dipenuhi: ${this.getSchemaInstruction(type, expectedQuestionCount)}.`,
-      'Jangan tambahkan field lain di level atas.',
-    ].join(' ');
+    const schemaInstruction = await this.getSchemaInstruction(
+      type,
+      expectedQuestionCount,
+    );
+
+    return await PromptTemplate.fromTemplate(REPAIR_PROMPT_TEMPLATE).format({
+      type,
+      validationError,
+      rawText: rawText || '{}',
+      schemaInstruction,
+    });
   }
 
-  private getSchemaInstruction(
+  private async getSchemaInstruction(
     type: AIOutputType,
     expectedQuestionCount?: number,
   ) {
+    const countInstruction = expectedQuestionCount
+      ? `"questions" wajib berisi tepat ${expectedQuestionCount} soal. `
+      : '';
+
     if (type === 'MCQ') {
-      const countInstruction = expectedQuestionCount
-        ? `"questions" wajib berisi tepat ${expectedQuestionCount} soal. `
-        : '';
-      return `${countInstruction}{ "questions": [{ "id": "q1", "text": "pertanyaan", "options": ["opsi A", "opsi B", "opsi C", "opsi D"], "answer": "A" }] }`;
+      return await PromptTemplate.fromTemplate(MCQ_SCHEMA_INSTRUCTION).format({
+        countInstruction,
+      });
     }
 
     if (type === 'ESSAY') {
-      const countInstruction = expectedQuestionCount
-        ? `"questions" wajib berisi tepat ${expectedQuestionCount} soal. `
-        : '';
-      return `${countInstruction}{ "questions": [{ "id": "q1", "text": "pertanyaan", "rubric": "pedoman penilaian" }] }`;
+      return await PromptTemplate.fromTemplate(ESSAY_SCHEMA_INSTRUCTION).format({
+        countInstruction,
+      });
     }
 
-    return '{ "summary": "ringkasan materi" }';
+    return SUMMARY_SCHEMA_INSTRUCTION;
   }
 
   private normalizeMcqContent(
