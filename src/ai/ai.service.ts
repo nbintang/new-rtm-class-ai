@@ -4,20 +4,15 @@ import { PromptTemplate } from '@langchain/core/prompts';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { AIJobStatus, Prisma } from '@prisma/client';
-import * as pdf from 'pdf-parse';
+// pdf-parse will be required locally in extractText to avoid import issues
 import { z } from 'zod';
 import { PrismaService } from '../prisma/prisma.service';
 import {
-  ESSAY_SCHEMA_INSTRUCTION,
-  ESSAY_TASK_INSTRUCTIONS,
-  GENERATION_PROMPT,
-  MCQ_SCHEMA_INSTRUCTION,
-  MCQ_TASK_INSTRUCTIONS,
-  REPAIR_PROMPT_TEMPLATE,
-  SUMMARY_SCHEMA_INSTRUCTION,
-  SUMMARY_TASK_INSTRUCTIONS,
-  SYSTEM_PROMPT,
+  AGENT_SYSTEM_PROMPT,
+  AGENT_USER_PROMPT,
 } from './prompts/ai.prompts';
+import { createAgent } from 'langchain';
+import { DynamicStructuredTool } from '@langchain/core/tools';
 
 type AIOutputType = 'MCQ' | 'ESSAY' | 'SUMMARY';
 
@@ -26,43 +21,6 @@ interface AIJobOptions {
   maxWords?: number | string;
   mcpEnabled?: boolean;
 }
-
-const mcqQuestionSchema = z.object({
-  id: z.string().trim().min(1),
-  text: z.string().trim().min(1),
-  options: z.array(z.string().trim().min(1)).length(4),
-  answer: z.enum(['A', 'B', 'C', 'D', 'a', 'b', 'c', 'd']),
-});
-
-const essayQuestionSchema = z.object({
-  id: z.string().trim().min(1),
-  text: z.string().trim().min(1),
-  rubric: z.string().trim().min(1),
-});
-
-const buildMcqGenerationSchema = (questionCount: number) =>
-  z.object({
-    questions: z.array(mcqQuestionSchema).length(questionCount),
-  });
-
-const buildEssayGenerationSchema = (questionCount: number) =>
-  z.object({
-    questions: z.array(essayQuestionSchema).length(questionCount),
-  });
-
-const summaryGenerationSchema = z.object({
-  summary: z.string().trim().min(1),
-});
-
-type McqGenerationResult = z.infer<ReturnType<typeof buildMcqGenerationSchema>>;
-type EssayGenerationResult = z.infer<
-  ReturnType<typeof buildEssayGenerationSchema>
->;
-type SummaryGenerationResult = z.infer<typeof summaryGenerationSchema>;
-type JsonInvocationResult = {
-  rawText: string;
-  json: unknown;
-};
 
 @Injectable()
 export class AiService implements OnModuleInit {
@@ -75,6 +33,7 @@ export class AiService implements OnModuleInit {
       apiKey: process.env.GROQ_API_KEY,
       model: 'qwen/qwen3-32b',
       temperature: 0.1,
+      maxTokens: 8192,
     });
   }
 
@@ -84,22 +43,41 @@ export class AiService implements OnModuleInit {
   }
 
   private async initMcpClient() {
+    if (this.mcpClient) return;
     try {
       this.mcpClient = new Client(
         { name: 'rtm-class-ai-client', version: '1.0.0' },
         { capabilities: {} },
       );
-
-      const mcpUrl = process.env.MCP_SERVER_URL || 'http://localhost:5002/mcp';
-      const transport = new StreamableHTTPClientTransport(new URL(mcpUrl));
-
-      await this.mcpClient.connect(transport);
-      this.logger.log(`Connected to MCP Server at ${mcpUrl}`);
+      this.logger.log('MCP Client instance created');
     } catch (error) {
-      this.mcpClient = null;
+      this.logger.error(`Failed to create MCP Client: ${this.getErrorMessage(error)}`);
+    }
+  }
+
+  private async ensureMcpConnected() {
+    await this.initMcpClient();
+    if (!this.mcpClient) {
+      throw new Error('MCP Client is not initialized');
+    }
+
+    // @ts-ignore - Jika sudah ada transport, tidak perlu connect lagi
+    if (this.mcpClient.transport) {
+      return;
+    }
+
+    try {
+      const mcpUrl = process.env.MCP_SERVER_URL || 'http://localhost:5002/mcp';
+      this.logger.log(`Establishing new MCP session at ${mcpUrl}...`);
+      const transport = new StreamableHTTPClientTransport(new URL(mcpUrl));
+      await this.mcpClient.connect(transport);
+      this.logger.log(`Successfully established session with MCP Server`);
+    } catch (error) {
+      if (error.message.includes('Already connected')) return;
       this.logger.error(
-        `Failed to connect to MCP Server: ${this.getErrorMessage(error)}`,
+        `Failed to establish MCP session: ${this.getErrorMessage(error)}`,
       );
+      throw error;
     }
   }
 
@@ -111,22 +89,89 @@ export class AiService implements OnModuleInit {
     options: AIJobOptions,
   ) {
     this.assertSupportedType(type);
-    this.logger.log(`Structured generation starting ${type} job: ${jobId}`);
+    this.logger.log(`LangChain Agent starting ${type} job: ${jobId}`);
 
     try {
       const text = await this.extractText(file);
-      const content = await this.generateContent(type, text, options);
+      this.logger.debug(`Extracted text (len: ${text.length}): ${text.substring(0, 200)}...`);
+      const questionCount = this.resolveCount(options.count, 5);
 
-      await this.saveAiOutput(jobId, materialId, type, content, options);
+      const toolNameForAgent = this.getSaveToolName(type as AIOutputType);
 
-      this.logger.log(
-        `Structured generation successfully finished job ${jobId}`,
+      // Definisi Tool untuk Agent
+      const saveTool = new DynamicStructuredTool({
+        name: toolNameForAgent,
+        description: `Simpan hasil generate ${type} ke database.`,
+        schema: z.object({
+          content: z
+            .any()
+            .describe('Objek JSON hasil generate yang sudah rapi.'),
+        }),
+        func: async (args) => {
+          this.logger.log(`Agent memanggil tool ${toolNameForAgent} untuk job ${jobId}`);
+          this.logger.debug(`Raw content dari AI: ${JSON.stringify(args.content)}`);
+
+          let normalizedContent = args.content;
+          try {
+            if (type === 'MCQ') {
+              normalizedContent = this.normalizeMcqContent(args.content);
+            } else if (type === 'ESSAY') {
+              normalizedContent = this.normalizeEssayContent(args.content);
+            } else if (type === 'SUMMARY') {
+              normalizedContent = this.normalizeSummaryContent(args.content, options);
+            }
+            this.logger.log(`Data berhasil dinormalisasi untuk job ${jobId}`);
+          } catch (e) {
+            this.logger.warn(`Gagal normalisasi otomatis: ${e.message}. Mengirim data asli.`);
+          }
+
+          await this.saveAiOutput(
+            jobId,
+            materialId,
+            type as AIOutputType,
+            normalizedContent,
+            options,
+          );
+          return `BERHASIL: Konten telah disimpan ke database. Tugas Anda SELESAI. Jangan memanggil tool ini lagi untuk job yang sama.`;
+        },
+      });
+
+      // Format Prompts
+      const formattedSystemPrompt = await PromptTemplate.fromTemplate(
+        AGENT_SYSTEM_PROMPT,
+      ).format({
+        text: text.substring(0, 10000),
+        type,
+        count: questionCount,
+        toolName: toolNameForAgent, // Oper nama tool ke prompt
+      });
+
+      const formattedUserPrompt = await PromptTemplate.fromTemplate(AGENT_USER_PROMPT).format({
+        type,
+        count: questionCount,
+      });
+
+      // Inisialisasi Agent
+      const agent = createAgent({
+        model: this.model,
+        tools: [saveTool],
+        systemPrompt: formattedSystemPrompt,
+      });
+
+      // Jalan!
+      await agent.invoke(
+        {
+          messages: [{ role: 'human', content: formattedUserPrompt }],
+        },
+        {
+          recursionLimit: 50, // Naikkan limit sedikit untuk berjaga-jaga
+        },
       );
+
+      this.logger.log(`LangChain Agent successfully finished job ${jobId}`);
     } catch (error) {
       const message = this.getErrorMessage(error);
-      this.logger.error(
-        `Structured generation failed job ${jobId}: ${message}`,
-      );
+      this.logger.error(`LangChain Agent failed job ${jobId}: ${message}`);
       await this.prisma.aiJob.update({
         where: { id: jobId },
         data: {
@@ -138,231 +183,136 @@ export class AiService implements OnModuleInit {
     }
   }
 
-  private async generateContent(
-    type: AIOutputType,
-    text: string,
-    options: AIJobOptions,
-  ): Promise<Record<string, unknown>> {
-    const questionCount = this.resolveCount(options.count, 5);
-    const prompt = await this.buildGenerationPrompt(
-      type,
-      text,
-      options,
-      questionCount,
-    );
+  private normalizeMcqContent(generated: any): Record<string, unknown> {
+    const rawQuestions =
+      generated?.questions ||
+      generated?.mcq_questions ||
+      generated?.MCQ ||
+      generated?.content?.questions ||
+      generated?.content?.mcq_questions ||
+      generated?.content?.MCQ ||
+      (Array.isArray(generated) ? generated : []);
 
-    if (type === 'MCQ') {
-      const generated = await this.generateValidatedJson(
-        type,
-        buildMcqGenerationSchema(questionCount),
-        prompt,
-        questionCount,
-      );
-      return this.normalizeMcqContent(generated);
-    }
+    const questions = rawQuestions
+      .map((q: any, i: number) => {
+        const options = (Array.isArray(q.options) ? q.options : [])
+          .slice(0, 4)
+          .map((opt: any) => String(opt).trim());
 
-    if (type === 'ESSAY') {
-      const generated = await this.generateValidatedJson(
-        type,
-        buildEssayGenerationSchema(questionCount),
-        prompt,
-        questionCount,
-      );
-      return this.normalizeEssayContent(generated);
-    }
-
-    const generated = await this.generateValidatedJson(
-      type,
-      summaryGenerationSchema,
-      prompt,
-    );
-    return this.normalizeSummaryContent(generated, options);
-  }
-
-  private async generateValidatedJson<TSchema extends z.ZodTypeAny>(
-    type: AIOutputType,
-    schema: TSchema,
-    prompt: string,
-    expectedQuestionCount?: number,
-  ): Promise<z.infer<TSchema>> {
-    let currentPrompt = prompt;
-    let lastRawText = '';
-    let lastErrorMessage = 'Unknown structured output failure.';
-
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      try {
-        const invocation = await this.invokeJsonObject(currentPrompt);
-        lastRawText = invocation.rawText;
-        return schema.parse(invocation.json);
-      } catch (error) {
-        lastErrorMessage = this.getErrorMessage(error);
-        this.logger.warn(
-          `Structured JSON validation failed for ${type} attempt ${attempt}: ${lastErrorMessage}`,
+        let answer = String(q.answer || 'A').trim();
+        const foundIndex = options.findIndex(
+          (opt) => opt.toLowerCase() === answer.toLowerCase(),
         );
 
-        if (attempt === 3) {
-          break;
+        if (foundIndex !== -1) {
+          answer = String.fromCharCode(65 + foundIndex);
+        } else {
+          const upperAnswer = answer.toUpperCase();
+          if (upperAnswer === '0') answer = 'A';
+          else if (upperAnswer === '1') answer = 'B';
+          else if (upperAnswer === '2') answer = 'C';
+          else if (upperAnswer === '3') answer = 'D';
+          else answer = upperAnswer.charAt(0);
         }
 
-        currentPrompt = await this.buildRepairPrompt(
-          type,
-          lastRawText,
-          lastErrorMessage,
-          expectedQuestionCount,
-        );
+        return {
+          id: (q.id || `q${i + 1}`).toString(),
+          text: (q.text || q.question || '').trim(),
+          options,
+          answer: ['A', 'B', 'C', 'D'].includes(answer) ? answer : 'A',
+          points: Number(q.points || 10),
+        };
+      })
+      .filter((q: any) => q.text && q.options.length === 4);
+
+    const defaultPoints = Math.floor(100 / (questions.length || 1)) || 5;
+
+    // Map dengan poin (pake poin AI kalau ada, kalau nggak pake default)
+    const processedQuestions = questions.map((q) => ({
+      ...q,
+      points: Number(q.points || defaultPoints),
+    }));
+
+    // Auto-Rebalance agar total points pas 100
+    if (processedQuestions.length > 0) {
+      const sumOfOthers = processedQuestions
+        .slice(0, -1)
+        .reduce((sum, q) => sum + q.points, 0);
+      
+      // Soal terakhir mengambil SISA agar total PAS 100
+      let lastPoint = 100 - sumOfOthers;
+      
+      // Keamanan: Jika sisa terlalu kecil (<= 0), paksa soal terakhir punya poin
+      if (lastPoint <= 0) {
+        lastPoint = 5;
+        // Kita tidak bisa memaksa 100 jika jumlah soal terlalu banyak, 
+        // tapi ini jauh lebih baik daripada 113.
       }
+      
+      processedQuestions[processedQuestions.length - 1].points = lastPoint;
     }
 
-    throw new Error(
-      `Unable to produce valid ${type} JSON after retries. Last error: ${lastErrorMessage}. Last output: ${lastRawText}`,
-    );
-  }
-
-  private async buildGenerationPrompt(
-    type: AIOutputType,
-    text: string,
-    options: AIJobOptions,
-    questionCount = this.resolveCount(options.count, 5),
-  ): Promise<string> {
-    const maxWords = this.resolveMaxWords(options.maxWords, 200);
-    const taskInstructions = await this.buildTaskInstructions(
-      type,
-      questionCount,
-      maxWords,
-    );
-
-    return PromptTemplate.fromTemplate(
-      `${SYSTEM_PROMPT}\n\n${GENERATION_PROMPT}`,
-    ).format({
-      text:
-        text.trim().slice(0, 12000) ||
-        'Materi tidak memiliki teks yang bisa diekstrak.',
-      type,
-      taskInstructions,
-    });
-  }
-
-  private async buildTaskInstructions(
-    type: AIOutputType,
-    questionCount: number,
-    maxWords: number,
-  ) {
-    if (type === 'MCQ') {
-      return await PromptTemplate.fromTemplate(MCQ_TASK_INSTRUCTIONS).format({
-        count: questionCount,
-      });
-    }
-
-    if (type === 'ESSAY') {
-      return await PromptTemplate.fromTemplate(ESSAY_TASK_INSTRUCTIONS).format({
-        count: questionCount,
-      });
-    }
-
-    return await PromptTemplate.fromTemplate(SUMMARY_TASK_INSTRUCTIONS).format({
-      maxWords,
-    });
-  }
-
-  private async invokeJsonObject(
-    prompt: string,
-  ): Promise<JsonInvocationResult> {
-    const jsonModel = this.model.withConfig({
-      response_format: { type: 'json_object' },
-    });
-    const response = await jsonModel.invoke(prompt);
-    const rawText = this.extractMessageText(response.content);
-
-    try {
-      return {
-        rawText,
-        json: JSON.parse(rawText),
-      };
-    } catch {
-      throw new Error(`Model returned invalid JSON text: ${rawText}`);
-    }
-  }
-
-  private async buildRepairPrompt(
-    type: AIOutputType,
-    rawText: string,
-    validationError: string,
-    expectedQuestionCount?: number,
-  ) {
-    const schemaInstruction = await this.getSchemaInstruction(
-      type,
-      expectedQuestionCount,
-    );
-
-    return await PromptTemplate.fromTemplate(REPAIR_PROMPT_TEMPLATE).format({
-      type,
-      validationError,
-      rawText: rawText || '{}',
-      schemaInstruction,
-    });
-  }
-
-  private async getSchemaInstruction(
-    type: AIOutputType,
-    expectedQuestionCount?: number,
-  ) {
-    const countInstruction = expectedQuestionCount
-      ? `"questions" wajib berisi tepat ${expectedQuestionCount} soal. `
-      : '';
-
-    if (type === 'MCQ') {
-      return await PromptTemplate.fromTemplate(MCQ_SCHEMA_INSTRUCTION).format({
-        countInstruction,
-      });
-    }
-
-    if (type === 'ESSAY') {
-      return await PromptTemplate.fromTemplate(ESSAY_SCHEMA_INSTRUCTION).format({
-        countInstruction,
-      });
-    }
-
-    return SUMMARY_SCHEMA_INSTRUCTION;
-  }
-
-  private normalizeMcqContent(
-    generated: McqGenerationResult,
-  ): Record<string, unknown> {
     return {
       type: 'MCQ',
       generatedAt: new Date().toISOString(),
-      questions: generated.questions.map((question, index) => ({
-        id: question.id.trim() || `q${index + 1}`,
-        text: question.text.trim(),
-        options: question.options.map((option) => option.trim()),
-        answer: question.answer.toUpperCase(),
-      })),
+      questions: processedQuestions,
     };
   }
 
-  private normalizeEssayContent(
-    generated: EssayGenerationResult,
-  ): Record<string, unknown> {
+  private normalizeEssayContent(generated: any): Record<string, unknown> {
+    const rawQuestions =
+      generated?.questions ||
+      generated?.ESSAY ||
+      generated?.content?.questions ||
+      generated?.content?.ESSAY ||
+      (Array.isArray(generated) ? generated : []);
+
+    const questions = rawQuestions
+      .map((q: any, i: number) => ({
+        id: (q.id || `q${i + 1}`).toString(),
+        text: (q.text || q.question || '').trim(),
+        rubric: (q.rubric || q.answer || 'Tidak ada rubrik spesifik.').trim(),
+        points: Number(q.points || 10),
+      }))
+      .filter((q: any) => q.text);
+
+    const defaultPoints = Math.floor(100 / (questions.length || 1)) || 5;
+
+    const processedQuestions = questions.map((q) => ({
+      ...q,
+      points: Number(q.points || defaultPoints),
+    }));
+
+    // Auto-Rebalance agar total points pas 100
+    if (processedQuestions.length > 0) {
+      const sumOfOthers = processedQuestions
+        .slice(0, -1)
+        .reduce((sum, q) => sum + q.points, 0);
+      
+      let lastPoint = 100 - sumOfOthers;
+      if (lastPoint <= 0) lastPoint = 5;
+      
+      processedQuestions[processedQuestions.length - 1].points = lastPoint;
+    }
+
     return {
       type: 'ESSAY',
       generatedAt: new Date().toISOString(),
-      questions: generated.questions.map((question, index) => ({
-        id: question.id.trim() || `q${index + 1}`,
-        text: question.text.trim(),
-        rubric: question.rubric.trim(),
-      })),
+      questions: processedQuestions,
     };
   }
 
   private normalizeSummaryContent(
-    generated: SummaryGenerationResult,
+    generated: any,
     options: AIJobOptions,
   ): Record<string, unknown> {
+    const summaryText = generated?.summary || (typeof generated === 'string' ? generated : '');
+    
     return {
       type: 'SUMMARY',
       generatedAt: new Date().toISOString(),
       summary: this.limitWords(
-        generated.summary.trim(),
+        summaryText.trim(),
         this.resolveMaxWords(options.maxWords, 200),
       ),
     };
@@ -397,61 +347,55 @@ export class AiService implements OnModuleInit {
       return;
     }
 
-    if (!this.mcpClient) {
-      throw new Error('MCP client is not connected.');
-    }
+    await this.ensureMcpConnected();
+    if (!this.mcpClient) throw new Error('MCP client is not initialized.');
 
     const toolName = this.getSaveToolName(type);
-    this.logger.log(
-      `Saving ${type} AI output via MCP tool ${toolName} for job ${jobId}`,
-    );
-    const result = await this.mcpClient.callTool({
-      name: toolName,
-      arguments: {
-        jobId,
-        materialId,
-        content,
-      },
-    });
+    try {
+      const result = await this.mcpClient.callTool({
+        name: toolName,
+        arguments: { jobId, materialId, content },
+      });
 
-    if (result.isError) {
-      throw new Error(`MCP tool ${toolName} returned an error.`);
-    }
+      if (result.isError) {
+        throw new Error(`MCP tool ${toolName} returned an error.`);
+      }
 
-    const structuredContent =
-      result.structuredContent && typeof result.structuredContent === 'object'
-        ? (result.structuredContent as Record<string, unknown>)
-        : undefined;
-    const success =
-      typeof structuredContent?.success === 'boolean'
-        ? structuredContent.success
-        : undefined;
-
-    if (success === false) {
-      const message =
-        typeof structuredContent?.message === 'string'
-          ? structuredContent.message
-          : `MCP tool ${toolName} failed.`;
-      throw new Error(message);
+      // Periksa apakah MCP mengembalikan sukses secara logis
+      const structuredContent = result.structuredContent as any;
+      if (structuredContent && structuredContent.success === false) {
+        throw new Error(`MCP save failed: ${structuredContent.message || 'Unknown error'}`);
+      }
+    } catch (error) {
+      const msg = this.getErrorMessage(error);
+      if (msg.includes('session') || msg.includes('Session')) {
+        this.logger.warn('MCP Session invalid/expired. Closing transport to force reconnect on next call.');
+        await this.mcpClient.close().catch(() => {});
+      }
+      throw error;
     }
   }
 
   private async extractText(file: Express.Multer.File): Promise<string> {
-    if (file.mimetype === 'application/pdf') {
-      const pdfParser = pdf as unknown as (
-        b: Buffer,
-      ) => Promise<{ text: string }>;
-      const data = await pdfParser(file.buffer);
-      return data.text;
-    }
+    const isPdf =
+      file.mimetype === 'application/pdf' ||
+      file.originalname.toLowerCase().endsWith('.pdf');
 
-    if (
-      file.mimetype ===
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-    ) {
-      throw new Error(
-        'PPTX extraction is not supported yet by this AI service.',
-      );
+    if (isPdf) {
+      try {
+        const { PDFParse } = require('pdf-parse');
+        
+        if (typeof PDFParse === 'function') {
+          const parser = new PDFParse({ data: file.buffer });
+          const result = await parser.getText();
+          await parser.destroy();
+          return result.text;
+        } else {
+          throw new Error('Could not find PDFParse class in pdf-parse');
+        }
+      } catch (error) {
+        this.logger.error(`Gagal mengekstrak PDF: ${error.message}`);
+      }
     }
 
     return file.buffer.toString('utf-8');
@@ -459,52 +403,29 @@ export class AiService implements OnModuleInit {
 
   private resolveCount(value: number | string | undefined, fallback: number) {
     const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallback;
-    }
-
-    return Math.min(100, Math.max(1, Math.trunc(parsed)));
+    return Number.isFinite(parsed) ? Math.min(100, Math.max(1, Math.trunc(parsed))) : fallback;
   }
 
-  private resolveMaxWords(
-    value: number | string | undefined,
-    fallback: number,
-  ) {
+  private resolveMaxWords(value: number | string | undefined, fallback: number) {
     const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      return fallback;
-    }
-
-    return Math.min(2000, Math.max(50, Math.trunc(parsed)));
+    return Number.isFinite(parsed) ? Math.min(2000, Math.max(50, Math.trunc(parsed))) : fallback;
   }
 
   private limitWords(text: string, maxWords: number) {
     const words = text.split(/\s+/).filter(Boolean);
-    if (words.length <= maxWords) {
-      return text;
-    }
-
-    return words.slice(0, maxWords).join(' ');
+    return words.length <= maxWords ? text : words.slice(0, maxWords).join(' ');
   }
 
   private assertSupportedType(type: string): asserts type is AIOutputType {
-    if (type === 'MCQ' || type === 'ESSAY' || type === 'SUMMARY') {
-      return;
+    if (type !== 'MCQ' && type !== 'ESSAY' && type !== 'SUMMARY') {
+      throw new Error(`Unsupported AI output type: ${type}`);
     }
-
-    throw new Error(`Unsupported AI output type: ${type}`);
   }
 
   private getErrorMessage(error: unknown) {
-    if (error instanceof z.ZodError) {
-      return JSON.stringify(error.issues);
-    }
-
-    if (error instanceof Error && error.message.trim()) {
-      return error.message.trim();
-    }
-
-    return 'Unknown AI processing error';
+    if (error instanceof z.ZodError) return JSON.stringify(error.issues);
+    if (error instanceof Error) return error.message;
+    return 'Unknown AI error';
   }
 
   private toInputJsonValue(value: unknown): Prisma.InputJsonValue {
@@ -512,46 +433,8 @@ export class AiService implements OnModuleInit {
   }
 
   private getSaveToolName(type: AIOutputType) {
-    if (type === 'MCQ') {
-      return 'save_mcq_output';
-    }
-
-    if (type === 'ESSAY') {
-      return 'save_essay_output';
-    }
-
+    if (type === 'MCQ') return 'save_mcq_output';
+    if (type === 'ESSAY') return 'save_essay_output';
     return 'save_summary_output';
-  }
-
-  private extractMessageText(content: unknown): string {
-    if (typeof content === 'string') {
-      return content.trim();
-    }
-
-    if (Array.isArray(content)) {
-      const text = content
-        .map((part) => {
-          if (typeof part === 'string') {
-            return part;
-          }
-
-          if (part && typeof part === 'object') {
-            const value = part as Record<string, unknown>;
-            if (typeof value.text === 'string') {
-              return value.text;
-            }
-          }
-
-          return '';
-        })
-        .join('')
-        .trim();
-
-      if (text) {
-        return text;
-      }
-    }
-
-    throw new Error('Model returned empty response content.');
   }
 }
