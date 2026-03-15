@@ -1,0 +1,65 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Build application
+        run: npm run build
+
+      - name: Run unit tests
+        run: npx jest --runInBand
+
+      - name: Build production Docker image
+        run: docker build -t rtm-class-ai:ci .
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            set -eu
+            APP_DIR="${{ secrets.VPS_APP_DIR }}"
+
+            if [ -z "$APP_DIR" ]; then
+              echo "VPS_APP_DIR secret is empty"
+              exit 1
+            fi
+
+            cd "$APP_DIR"
+            git checkout main
+            git pull --ff-only origin main
+            chmod +x scripts/deploy.sh
+            APP_DIR="$APP_DIR" ./scripts/deploy.sh

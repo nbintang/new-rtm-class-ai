@@ -15,8 +15,6 @@ services:
     environment:
       NODE_ENV: production
       NODE_OPTIONS: ${NODE_OPTIONS:---no-network-family-autoselection --dns-result-order=ipv4first}
-      DATABASE_URL: ${DATABASE_URL_DOCKER}
-      MCP_SERVER_URL: ${MCP_SERVER_URL_DOCKER:-http://host.docker.internal:5002/mcp}
       HTTP_PROXY: ${APP_HTTP_PROXY:-}
       HTTPS_PROXY: ${APP_HTTPS_PROXY:-}
       NO_PROXY: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
@@ -44,7 +42,6 @@ services:
     environment:
       NODE_ENV: production
       NODE_OPTIONS: ${NODE_OPTIONS:---no-network-family-autoselection --dns-result-order=ipv4first}
-      DATABASE_URL: ${DATABASE_URL_DOCKER}
       HTTP_PROXY: ${APP_HTTP_PROXY:-}
       HTTPS_PROXY: ${APP_HTTPS_PROXY:-}
       NO_PROXY: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
@@ -70,8 +67,6 @@ services:
     environment:
       NODE_ENV: development
       NODE_OPTIONS: ${NODE_OPTIONS:---no-network-family-autoselection --dns-result-order=ipv4first}
-      DATABASE_URL: ${DATABASE_URL_DOCKER}
-      MCP_SERVER_URL: ${MCP_SERVER_URL_DOCKER:-http://host.docker.internal:5002/mcp}
       CHOKIDAR_USEPOLLING: 'true'
       WATCHPACK_POLLING: 'true'
       TSC_WATCHFILE: FixedPollingInterval

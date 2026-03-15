@@ -21,4 +21,4 @@ COPY prisma ./prisma
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 EXPOSE 5001
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/main"]
+CMD ["node", "dist/main"]
