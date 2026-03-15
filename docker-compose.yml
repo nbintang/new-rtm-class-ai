@@ -1,6 +1,6 @@
 services:
-  api:
-    container_name: rtm-class-ai-api
+  ai:
+    container_name: rtm-class-ai
     profiles: ['prod']
     build:
       context: .
@@ -26,8 +26,8 @@ services:
     extra_hosts:
       - 'host.docker.internal:host-gateway'
 
-  api-migrate:
-    container_name: rtm-class-ai-api-migrate
+  ai-migrate: 
+    container_name: rtm-class-ai-migrate
     profiles: ['prod']
     build:
       context: .
@@ -49,8 +49,8 @@ services:
       https_proxy: ${APP_HTTPS_PROXY:-}
       no_proxy: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
 
-  api-dev:
-    container_name: rtm-class-ai-api-dev
+  ai-dev:
+    container_name: rtm-class-ai-dev
     profiles: ['dev']
     build:
       context: .
