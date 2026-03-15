@@ -1,0 +1,91 @@
+services:
+  api:
+    container_name: rtm-class-ai-api
+    profiles: ['prod']
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: true
+      - path: .env.local
+        required: false
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: ${NODE_OPTIONS:---no-network-family-autoselection --dns-result-order=ipv4first}
+      DATABASE_URL: ${DATABASE_URL_DOCKER}
+      MCP_SERVER_URL: ${MCP_SERVER_URL_DOCKER:-http://host.docker.internal:5002/mcp}
+      HTTP_PROXY: ${APP_HTTP_PROXY:-}
+      HTTPS_PROXY: ${APP_HTTPS_PROXY:-}
+      NO_PROXY: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
+      http_proxy: ${APP_HTTP_PROXY:-}
+      https_proxy: ${APP_HTTPS_PROXY:-}
+      no_proxy: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
+    ports:
+      - '${PORT:-5001}:5001'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+
+  api-migrate:
+    container_name: rtm-class-ai-api-migrate
+    profiles: ['prod']
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    env_file:
+      - path: .env
+        required: true
+      - path: .env.local
+        required: false
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: ${NODE_OPTIONS:---no-network-family-autoselection --dns-result-order=ipv4first}
+      DATABASE_URL: ${DATABASE_URL_DOCKER}
+      HTTP_PROXY: ${APP_HTTP_PROXY:-}
+      HTTPS_PROXY: ${APP_HTTPS_PROXY:-}
+      NO_PROXY: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
+      http_proxy: ${APP_HTTP_PROXY:-}
+      https_proxy: ${APP_HTTPS_PROXY:-}
+      no_proxy: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
+
+  api-dev:
+    container_name: rtm-class-ai-api-dev
+    profiles: ['dev']
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: deps
+    working_dir: /app
+    command: ['sh', '-c', 'npx prisma generate && npm run start:dev']
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: true
+      - path: .env.local
+        required: false
+    environment:
+      NODE_ENV: development
+      NODE_OPTIONS: ${NODE_OPTIONS:---no-network-family-autoselection --dns-result-order=ipv4first}
+      DATABASE_URL: ${DATABASE_URL_DOCKER}
+      MCP_SERVER_URL: ${MCP_SERVER_URL_DOCKER:-http://host.docker.internal:5002/mcp}
+      CHOKIDAR_USEPOLLING: 'true'
+      WATCHPACK_POLLING: 'true'
+      TSC_WATCHFILE: FixedPollingInterval
+      TSC_WATCHDIRECTORY: DynamicPriorityPolling
+      HTTP_PROXY: ${APP_HTTP_PROXY:-}
+      HTTPS_PROXY: ${APP_HTTPS_PROXY:-}
+      NO_PROXY: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
+      http_proxy: ${APP_HTTP_PROXY:-}
+      https_proxy: ${APP_HTTPS_PROXY:-}
+      no_proxy: ${APP_NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
+    ports:
+      - '${PORT:-5001}:5001'
+    volumes:
+      - .:/app
+      - /app/node_modules
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
