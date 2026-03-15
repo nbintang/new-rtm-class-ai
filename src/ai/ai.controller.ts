@@ -7,7 +7,18 @@ import {
   Logger,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { AiService } from './ai.service';
+import { AiService } from './services/ai.service';
+import {
+  essayRequestSchema,
+  mcqRequestSchema,
+  summaryRequestSchema,
+} from './dto/ai-request.dto';
+import type {
+  EssayRequestDto,
+  McqRequestDto,
+  SummaryRequestDto,
+} from './dto/ai-request.dto';
+import { ZodValidationPipe } from './pipes/zod-validation.pipe';
 
 @Controller('api')
 export class AiController {
@@ -19,12 +30,10 @@ export class AiController {
   @UseInterceptors(FileInterceptor('file'))
   async generateMcq(
     @UploadedFile() file: Express.Multer.File,
-    @Body() body: any,
+    @Body(new ZodValidationPipe(mcqRequestSchema)) body: McqRequestDto,
   ) {
     this.logger.log(`Received MCQ Request for Job ID: ${body.job_id}`);
-    
-    // Kita jalankan di background (tidak pakai await di sini) 
-    // agar backend lama tidak timeout menunggu proses AI yang lama
+
     void this.aiService.processJob(
       body.job_id,
       body.material_id,
@@ -32,8 +41,8 @@ export class AiController {
       file,
       {
         count: body.mcq_count,
-        mcpEnabled: body.mcp_enabled === 'true'
-      }
+        mcpEnabled: body.mcp_enabled,
+      },
     );
 
     return {
@@ -47,7 +56,7 @@ export class AiController {
   @UseInterceptors(FileInterceptor('file'))
   async generateEssay(
     @UploadedFile() file: Express.Multer.File,
-    @Body() body: any,
+    @Body(new ZodValidationPipe(essayRequestSchema)) body: EssayRequestDto,
   ) {
     this.logger.log(`Received Essay Request for Job ID: ${body.job_id}`);
     
@@ -58,8 +67,8 @@ export class AiController {
       file,
       {
         count: body.essay_count,
-        mcpEnabled: body.mcp_enabled === 'true'
-      }
+        mcpEnabled: body.mcp_enabled,
+      },
     );
 
     return {
@@ -73,7 +82,7 @@ export class AiController {
   @UseInterceptors(FileInterceptor('file'))
   async generateSummary(
     @UploadedFile() file: Express.Multer.File,
-    @Body() body: any,
+    @Body(new ZodValidationPipe(summaryRequestSchema)) body: SummaryRequestDto,
   ) {
     this.logger.log(`Received Summary Request for Job ID: ${body.job_id}`);
     
@@ -84,8 +93,8 @@ export class AiController {
       file,
       {
         maxWords: body.summary_max_words,
-        mcpEnabled: body.mcp_enabled === 'true'
-      }
+        mcpEnabled: body.mcp_enabled,
+      },
     );
 
     return {

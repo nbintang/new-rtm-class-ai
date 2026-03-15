@@ -1,14 +1,13 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { AiController } from './ai/ai.controller';
-import { AiService } from './ai/ai.service';
-import { PrismaService } from './prisma/prisma.service';
-import { ConfigModule } from '@nestjs/config';
+import { OauthModule } from './oauth/oauth.module';
+import { AppConfigModule } from './config/config.module';
+import { AiModule } from './ai/ai.module';
 
 @Module({
-  imports: [ConfigModule.forRoot()],
-  controllers: [AppController, AiController],
-  providers: [AppService, AiService, PrismaService],
+  imports: [AppConfigModule, OauthModule, AiModule],
+  controllers: [AppController],
+  providers: [AppService],
 })
 export class AppModule {}

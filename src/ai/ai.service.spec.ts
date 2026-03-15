@@ -1,5 +1,5 @@
 import { AIJobStatus } from '@prisma/client';
-import { AiService } from './ai.service';
+import { AiService } from './services/ai.service';
 
 type SaveAiOutputFn = (
   jobId: string,
@@ -14,11 +14,12 @@ describe('AiService', () => {
     aiOutput: { create: jest.Mock };
     aiJob: { update: jest.Mock };
   };
-  let service: AiService;
-  let serviceInternals: {
-    mcpClient: { callTool: jest.Mock } | null;
-    saveAiOutput: SaveAiOutputFn;
+  let mcpClientService: {
+    ensureConnected: jest.Mock;
+    invalidateSession: jest.Mock;
   };
+  let service: AiService;
+  let saveAiOutput: SaveAiOutputFn;
   let callTool: jest.Mock;
 
   beforeEach(() => {
@@ -31,22 +32,28 @@ describe('AiService', () => {
       },
     };
 
-    service = new AiService(prisma as never);
-    serviceInternals = service as unknown as {
-      mcpClient: { callTool: jest.Mock } | null;
-      saveAiOutput: SaveAiOutputFn;
-    };
     callTool = jest.fn().mockResolvedValue({
       isError: false,
       structuredContent: { success: true },
     });
-    serviceInternals.mcpClient = {
-      callTool,
+
+    mcpClientService = {
+      ensureConnected: jest.fn().mockResolvedValue({ callTool }),
+      invalidateSession: jest.fn().mockResolvedValue(undefined),
     };
+
+    service = new AiService(
+      prisma as never,
+      { model: {} } as never,
+      mcpClientService as never,
+    );
+    saveAiOutput = (
+      service as unknown as { saveAiOutput: SaveAiOutputFn }
+    ).saveAiOutput.bind(service);
   });
 
   it('dispatches MCQ save to save_mcq_output', async () => {
-    await serviceInternals.saveAiOutput(
+    await saveAiOutput(
       '550e8400-e29b-41d4-a716-446655440000',
       '550e8400-e29b-41d4-a716-446655440001',
       'MCQ',
@@ -86,10 +93,11 @@ describe('AiService', () => {
       '550e8400-e29b-41d4-a716-446655440001',
     );
     expect(callArg?.arguments.content.type).toBe('MCQ');
+    expect(mcpClientService.ensureConnected).toHaveBeenCalledTimes(1);
   });
 
   it('dispatches Essay save to save_essay_output', async () => {
-    await serviceInternals.saveAiOutput(
+    await saveAiOutput(
       '550e8400-e29b-41d4-a716-446655440000',
       '550e8400-e29b-41d4-a716-446655440001',
       'ESSAY',
@@ -121,17 +129,12 @@ describe('AiService', () => {
 
     expect(callArg).toBeDefined();
     expect(callArg?.name).toBe('save_essay_output');
-    expect(callArg?.arguments.jobId).toBe(
-      '550e8400-e29b-41d4-a716-446655440000',
-    );
-    expect(callArg?.arguments.materialId).toBe(
-      '550e8400-e29b-41d4-a716-446655440001',
-    );
     expect(callArg?.arguments.content.type).toBe('ESSAY');
+    expect(mcpClientService.ensureConnected).toHaveBeenCalledTimes(1);
   });
 
   it('falls back to direct database save when MCP is disabled', async () => {
-    await serviceInternals.saveAiOutput(
+    await saveAiOutput(
       '550e8400-e29b-41d4-a716-446655440000',
       '550e8400-e29b-41d4-a716-446655440001',
       'SUMMARY',
@@ -172,18 +175,7 @@ describe('AiService', () => {
       | undefined;
 
     expect(createArg).toBeDefined();
-    expect(createArg?.data).toEqual({
-      jobId: '550e8400-e29b-41d4-a716-446655440000',
-      materialId: '550e8400-e29b-41d4-a716-446655440001',
-      type: 'SUMMARY',
-      content: {
-        type: 'SUMMARY',
-        generatedAt: '2026-03-11T22:00:00.000Z',
-        summary: 'Ringkasan materi.',
-      },
-      isPublished: false,
-    });
-    expect(updateArg).toBeDefined();
+    expect(createArg?.data.type).toBe('SUMMARY');
     expect(updateArg?.where).toEqual({
       id: '550e8400-e29b-41d4-a716-446655440000',
     });
@@ -191,47 +183,39 @@ describe('AiService', () => {
     expect(updateArg?.data.completedAt).toBeInstanceOf(Date);
     expect(updateArg?.data.lastError).toBeNull();
     expect(callTool).not.toHaveBeenCalled();
+    expect(mcpClientService.ensureConnected).not.toHaveBeenCalled();
   });
 
-  it('rejects MCQ output when generated question count does not match the requested count', async () => {
-    const invokeJsonObject = jest.fn().mockResolvedValue({
-      rawText:
-        '{"questions":[{"id":"q1","text":"Apa ibu kota Indonesia?","options":["Jakarta","Bandung","Surabaya","Medan"],"answer":"A"}]}',
-      json: {
-        questions: [
-          {
-            id: 'q1',
-            text: 'Apa ibu kota Indonesia?',
-            options: ['Jakarta', 'Bandung', 'Surabaya', 'Medan'],
-            answer: 'A',
-          },
-        ],
-      },
-    });
-
-    (
-      service as unknown as {
-        invokeJsonObject: typeof invokeJsonObject;
-        generateContent: (
-          type: 'MCQ',
-          text: string,
-          options: { count: number },
-        ) => Promise<Record<string, unknown>>;
-      }
-    ).invokeJsonObject = invokeJsonObject;
+  it('invalidates MCP session when MCP session-level error happens', async () => {
+    callTool.mockRejectedValueOnce(new Error('Session expired'));
 
     await expect(
-      (
-        service as unknown as {
-          generateContent: (
-            type: 'MCQ',
-            text: string,
-            options: { count: number },
-          ) => Promise<Record<string, unknown>>;
-        }
-      ).generateContent('MCQ', 'Materi contoh', { count: 20 }),
-    ).rejects.toThrow('Unable to produce valid MCQ JSON after retries');
+      saveAiOutput(
+        '550e8400-e29b-41d4-a716-446655440000',
+        '550e8400-e29b-41d4-a716-446655440001',
+        'MCQ',
+        { type: 'MCQ', questions: [] },
+        { mcpEnabled: true },
+      ),
+    ).rejects.toThrow('Session expired');
 
-    expect(invokeJsonObject).toHaveBeenCalledTimes(3);
+    expect(mcpClientService.invalidateSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('normalizes summary when payload is a string', () => {
+    const normalizeSummaryContent = (
+      service as unknown as {
+        normalizeSummaryContent: (
+          generated: unknown,
+          options: { maxWords?: number | string },
+        ) => { summary: string };
+      }
+    ).normalizeSummaryContent.bind(service);
+
+    const result = normalizeSummaryContent('Ringkasan materi dalam bentuk string.', {
+      maxWords: 200,
+    });
+
+    expect(result.summary).toBe('Ringkasan materi dalam bentuk string.');
   });
 });

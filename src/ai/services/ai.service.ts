@@ -1,16 +1,11 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { ChatGroq } from '@langchain/groq';
+import { Injectable, Logger } from '@nestjs/common';
 import { PromptTemplate } from '@langchain/core/prompts';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { AIJobStatus, Prisma } from '@prisma/client';
-// pdf-parse will be required locally in extractText to avoid import issues
 import { z } from 'zod';
-import { PrismaService } from '../prisma/prisma.service';
-import {
-  AGENT_SYSTEM_PROMPT,
-  AGENT_USER_PROMPT,
-} from './prompts/ai.prompts';
+import { PrismaService } from '../../prisma/prisma.service';
+import { GroqProvider } from './groq.provider';
+import { McpClientService } from './mcp-client.service';
+import { AGENT_SYSTEM_PROMPT, AGENT_USER_PROMPT } from '../prompts/ai.prompts';
 import { createAgent } from 'langchain';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 
@@ -23,63 +18,14 @@ interface AIJobOptions {
 }
 
 @Injectable()
-export class AiService implements OnModuleInit {
+export class AiService {
   private readonly logger = new Logger(AiService.name);
-  private readonly model: ChatGroq;
-  private mcpClient: Client | null = null;
 
-  constructor(private readonly prisma: PrismaService) {
-    this.model = new ChatGroq({
-      apiKey: process.env.GROQ_API_KEY,
-      model: 'qwen/qwen3-32b',
-      temperature: 0.1,
-      maxTokens: 8192,
-    });
-  }
-
-  async onModuleInit() {
-    this.logger.log('AI Service Initialized with Groq');
-    await this.initMcpClient();
-  }
-
-  private async initMcpClient() {
-    if (this.mcpClient) return;
-    try {
-      this.mcpClient = new Client(
-        { name: 'rtm-class-ai-client', version: '1.0.0' },
-        { capabilities: {} },
-      );
-      this.logger.log('MCP Client instance created');
-    } catch (error) {
-      this.logger.error(`Failed to create MCP Client: ${this.getErrorMessage(error)}`);
-    }
-  }
-
-  private async ensureMcpConnected() {
-    await this.initMcpClient();
-    if (!this.mcpClient) {
-      throw new Error('MCP Client is not initialized');
-    }
-
-    // @ts-ignore - Jika sudah ada transport, tidak perlu connect lagi
-    if (this.mcpClient.transport) {
-      return;
-    }
-
-    try {
-      const mcpUrl = process.env.MCP_SERVER_URL || 'http://localhost:5002/mcp';
-      this.logger.log(`Establishing new MCP session at ${mcpUrl}...`);
-      const transport = new StreamableHTTPClientTransport(new URL(mcpUrl));
-      await this.mcpClient.connect(transport);
-      this.logger.log(`Successfully established session with MCP Server`);
-    } catch (error) {
-      if (error.message.includes('Already connected')) return;
-      this.logger.error(
-        `Failed to establish MCP session: ${this.getErrorMessage(error)}`,
-      );
-      throw error;
-    }
-  }
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly groqProvider: GroqProvider,
+    private readonly mcpClientService: McpClientService,
+  ) {}
 
   async processJob(
     jobId: string,
@@ -93,12 +39,13 @@ export class AiService implements OnModuleInit {
 
     try {
       const text = await this.extractText(file);
-      this.logger.debug(`Extracted text (len: ${text.length}): ${text.substring(0, 200)}...`);
+      this.logger.debug(
+        `Extracted text (len: ${text.length}): ${text.substring(0, 200)}...`,
+      );
       const questionCount = this.resolveCount(options.count, 5);
 
       const toolNameForAgent = this.getSaveToolName(type as AIOutputType);
 
-      // Definisi Tool untuk Agent
       const saveTool = new DynamicStructuredTool({
         name: toolNameForAgent,
         description: `Simpan hasil generate ${type} ke database.`,
@@ -108,8 +55,12 @@ export class AiService implements OnModuleInit {
             .describe('Objek JSON hasil generate yang sudah rapi.'),
         }),
         func: async (args) => {
-          this.logger.log(`Agent memanggil tool ${toolNameForAgent} untuk job ${jobId}`);
-          this.logger.debug(`Raw content dari AI: ${JSON.stringify(args.content)}`);
+          this.logger.log(
+            `Agent memanggil tool ${toolNameForAgent} untuk job ${jobId}`,
+          );
+          this.logger.debug(
+            `Raw content dari AI: ${JSON.stringify(args.content)}`,
+          );
 
           let normalizedContent = args.content;
           try {
@@ -118,11 +69,16 @@ export class AiService implements OnModuleInit {
             } else if (type === 'ESSAY') {
               normalizedContent = this.normalizeEssayContent(args.content);
             } else if (type === 'SUMMARY') {
-              normalizedContent = this.normalizeSummaryContent(args.content, options);
+              normalizedContent = this.normalizeSummaryContent(
+                args.content,
+                options,
+              );
             }
             this.logger.log(`Data berhasil dinormalisasi untuk job ${jobId}`);
           } catch (e) {
-            this.logger.warn(`Gagal normalisasi otomatis: ${e.message}. Mengirim data asli.`);
+            this.logger.warn(
+              `Gagal normalisasi otomatis: ${e.message}. Mengirim data asli.`,
+            );
           }
 
           await this.saveAiOutput(
@@ -136,50 +92,52 @@ export class AiService implements OnModuleInit {
         },
       });
 
-      // Format Prompts
       const formattedSystemPrompt = await PromptTemplate.fromTemplate(
         AGENT_SYSTEM_PROMPT,
       ).format({
         text: text.substring(0, 10000),
         type,
         count: questionCount,
-        toolName: toolNameForAgent, // Oper nama tool ke prompt
+        toolName: toolNameForAgent,
       });
 
-      const formattedUserPrompt = await PromptTemplate.fromTemplate(AGENT_USER_PROMPT).format({
+      const formattedUserPrompt = await PromptTemplate.fromTemplate(
+        AGENT_USER_PROMPT,
+      ).format({
         type,
         count: questionCount,
       });
 
-      // Inisialisasi Agent
       const agent = createAgent({
-        model: this.model,
+        model: this.groqProvider.model,
         tools: [saveTool],
         systemPrompt: formattedSystemPrompt,
       });
 
-      // Jalan!
       await agent.invoke(
-        {
-          messages: [{ role: 'human', content: formattedUserPrompt }],
-        },
-        {
-          recursionLimit: 50, // Naikkan limit sedikit untuk berjaga-jaga
-        },
+        { messages: [{ role: 'human', content: formattedUserPrompt }] },
+        { recursionLimit: 50 },
       );
 
       this.logger.log(`LangChain Agent successfully finished job ${jobId}`);
     } catch (error) {
       const message = this.getErrorMessage(error);
       this.logger.error(`LangChain Agent failed job ${jobId}: ${message}`);
-      await this.prisma.aiJob.update({
-        where: { id: jobId },
-        data: {
-          status: AIJobStatus.failed_processing,
-          lastError: message,
-          completedAt: new Date(),
-        },
-      });
+
+      try {
+        await this.prisma.aiJob.update({
+          where: { id: jobId },
+          data: {
+            status: AIJobStatus.failed_processing,
+            lastError: message,
+            completedAt: new Date(),
+          },
+        });
+      } catch (prismaError) {
+        this.logger.error(
+          `Failed to update job status for ${jobId}: ${prismaError.message}`,
+        );
+      }
     }
   }
 
@@ -226,36 +184,15 @@ export class AiService implements OnModuleInit {
       .filter((q: any) => q.text && q.options.length === 4);
 
     const defaultPoints = Math.floor(100 / (questions.length || 1)) || 5;
-
-    // Map dengan poin (pake poin AI kalau ada, kalau nggak pake default)
     const processedQuestions = questions.map((q) => ({
       ...q,
       points: Number(q.points || defaultPoints),
     }));
 
-    // Auto-Rebalance agar total points pas 100
-    if (processedQuestions.length > 0) {
-      const sumOfOthers = processedQuestions
-        .slice(0, -1)
-        .reduce((sum, q) => sum + q.points, 0);
-      
-      // Soal terakhir mengambil SISA agar total PAS 100
-      let lastPoint = 100 - sumOfOthers;
-      
-      // Keamanan: Jika sisa terlalu kecil (<= 0), paksa soal terakhir punya poin
-      if (lastPoint <= 0) {
-        lastPoint = 5;
-        // Kita tidak bisa memaksa 100 jika jumlah soal terlalu banyak, 
-        // tapi ini jauh lebih baik daripada 113.
-      }
-      
-      processedQuestions[processedQuestions.length - 1].points = lastPoint;
-    }
-
     return {
       type: 'MCQ',
       generatedAt: new Date().toISOString(),
-      questions: processedQuestions,
+      questions: this.adjustLastQuestionPoints(processedQuestions),
     };
   }
 
@@ -283,22 +220,10 @@ export class AiService implements OnModuleInit {
       points: Number(q.points || defaultPoints),
     }));
 
-    // Auto-Rebalance agar total points pas 100
-    if (processedQuestions.length > 0) {
-      const sumOfOthers = processedQuestions
-        .slice(0, -1)
-        .reduce((sum, q) => sum + q.points, 0);
-      
-      let lastPoint = 100 - sumOfOthers;
-      if (lastPoint <= 0) lastPoint = 5;
-      
-      processedQuestions[processedQuestions.length - 1].points = lastPoint;
-    }
-
     return {
       type: 'ESSAY',
       generatedAt: new Date().toISOString(),
-      questions: processedQuestions,
+      questions: this.adjustLastQuestionPoints(processedQuestions),
     };
   }
 
@@ -306,8 +231,9 @@ export class AiService implements OnModuleInit {
     generated: any,
     options: AIJobOptions,
   ): Record<string, unknown> {
-    const summaryText = generated?.summary || (typeof generated === 'string' ? generated : '');
-    
+    const summaryText =
+      generated?.summary || (typeof generated === 'string' ? generated : '');
+
     return {
       type: 'SUMMARY',
       generatedAt: new Date().toISOString(),
@@ -316,6 +242,28 @@ export class AiService implements OnModuleInit {
         this.resolveMaxWords(options.maxWords, 200),
       ),
     };
+  }
+
+  private adjustLastQuestionPoints<
+    TQuestion extends {
+      points: number;
+    },
+  >(questions: TQuestion[]): TQuestion[] {
+    if (questions.length === 0) return questions;
+
+    const normalized = questions.map((question) => ({
+      ...question,
+      points: Number(question.points || 0),
+    }));
+
+    const sumOfOthers = normalized
+      .slice(0, -1)
+      .reduce((sum, question) => sum + question.points, 0);
+
+    const remainder = 100 - sumOfOthers;
+    normalized[normalized.length - 1].points = remainder > 0 ? remainder : 5;
+
+    return normalized as TQuestion[];
   }
 
   private async saveAiOutput(
@@ -347,12 +295,11 @@ export class AiService implements OnModuleInit {
       return;
     }
 
-    await this.ensureMcpConnected();
-    if (!this.mcpClient) throw new Error('MCP client is not initialized.');
+    const mcpClient = await this.mcpClientService.ensureConnected();
 
     const toolName = this.getSaveToolName(type);
     try {
-      const result = await this.mcpClient.callTool({
+      const result = await mcpClient.callTool({
         name: toolName,
         arguments: { jobId, materialId, content },
       });
@@ -361,16 +308,17 @@ export class AiService implements OnModuleInit {
         throw new Error(`MCP tool ${toolName} returned an error.`);
       }
 
-      // Periksa apakah MCP mengembalikan sukses secara logis
       const structuredContent = result.structuredContent as any;
       if (structuredContent && structuredContent.success === false) {
-        throw new Error(`MCP save failed: ${structuredContent.message || 'Unknown error'}`);
+        throw new Error(
+          `MCP save failed: ${structuredContent.message || 'Unknown error'}`,
+        );
       }
     } catch (error) {
       const msg = this.getErrorMessage(error);
-      if (msg.includes('session') || msg.includes('Session')) {
-        this.logger.warn('MCP Session invalid/expired. Closing transport to force reconnect on next call.');
-        await this.mcpClient.close().catch(() => {});
+      if (msg.toLowerCase().includes('session')) {
+        this.logger.warn('MCP session invalid/expired. Forcing reconnect.');
+        await this.mcpClientService.invalidateSession();
       }
       throw error;
     }
@@ -383,15 +331,16 @@ export class AiService implements OnModuleInit {
 
     if (isPdf) {
       try {
-        // Polyfill untuk lingkungan server (deployment) agar pdf-parse tidak error
         if (typeof global !== 'undefined') {
-          (global as any).DOMMatrix = (global as any).DOMMatrix || class DOMMatrix {};
-          (global as any).ImageData = (global as any).ImageData || class ImageData {};
+          (global as any).DOMMatrix =
+            (global as any).DOMMatrix || class DOMMatrix {};
+          (global as any).ImageData =
+            (global as any).ImageData || class ImageData {};
           (global as any).Path2D = (global as any).Path2D || class Path2D {};
         }
 
         const { PDFParse } = require('pdf-parse');
-        
+
         if (typeof PDFParse === 'function') {
           const parser = new PDFParse({ data: file.buffer });
           const result = await parser.getText();
@@ -410,12 +359,19 @@ export class AiService implements OnModuleInit {
 
   private resolveCount(value: number | string | undefined, fallback: number) {
     const parsed = Number(value);
-    return Number.isFinite(parsed) ? Math.min(100, Math.max(1, Math.trunc(parsed))) : fallback;
+    return Number.isFinite(parsed)
+      ? Math.min(100, Math.max(1, Math.trunc(parsed)))
+      : fallback;
   }
 
-  private resolveMaxWords(value: number | string | undefined, fallback: number) {
+  private resolveMaxWords(
+    value: number | string | undefined,
+    fallback: number,
+  ) {
     const parsed = Number(value);
-    return Number.isFinite(parsed) ? Math.min(2000, Math.max(50, Math.trunc(parsed))) : fallback;
+    return Number.isFinite(parsed)
+      ? Math.min(2000, Math.max(50, Math.trunc(parsed)))
+      : fallback;
   }
 
   private limitWords(text: string, maxWords: number) {
