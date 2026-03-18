@@ -1,5 +1,5 @@
 import { AIJobStatus } from '@prisma/client';
-import { AiService } from './services/ai.service';
+import { AiService } from './ai.service';
 
 type SaveAiOutputFn = (
   jobId: string,

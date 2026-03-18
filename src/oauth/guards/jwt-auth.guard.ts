@@ -6,12 +6,11 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
-import { Request } from 'express';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
 import { AppConfigService } from '../../config/config.service';
- 
+import type { FastifyRequest } from 'fastify';
 
-type AuthenticatedRequest = Request & {
+type AuthenticatedRequest = FastifyRequest & {
   auth?: Record<string, unknown>;
 };
 
@@ -60,6 +59,10 @@ export class JwtAuthGuard implements CanActivate {
   }
 
   private extractBearerToken(authorization?: string): string | null {
+    if (Array.isArray(authorization)) {
+      authorization = authorization[0];
+    }
+
     if (!authorization) return null;
     const [type, token] = authorization.split(' ');
     if (type !== 'Bearer' || !token) return null;

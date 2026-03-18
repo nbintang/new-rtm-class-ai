@@ -8,6 +8,7 @@ import { McpClientService } from './mcp-client.service';
 import { AGENT_SYSTEM_PROMPT, AGENT_USER_PROMPT } from '../prompts/ai.prompts';
 import { createAgent } from 'langchain';
 import { DynamicStructuredTool } from '@langchain/core/tools';
+import type { UploadedFile } from '../interfaces/uploaded-file.interface';
 
 type AIOutputType = 'MCQ' | 'ESSAY' | 'SUMMARY';
 
@@ -31,7 +32,7 @@ export class AiService {
     jobId: string,
     materialId: string,
     type: string,
-    file: Express.Multer.File,
+    file: UploadedFile,
     options: AIJobOptions,
   ) {
     this.assertSupportedType(type);
@@ -324,7 +325,7 @@ export class AiService {
     }
   }
 
-  private async extractText(file: Express.Multer.File): Promise<string> {
+  private async extractText(file: UploadedFile): Promise<string> {
     const isPdf =
       file.mimetype === 'application/pdf' ||
       file.originalname.toLowerCase().endsWith('.pdf');
