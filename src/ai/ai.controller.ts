@@ -2,7 +2,6 @@ import {
   BadRequestException,
   Controller,
   Post,
-  Body,
   Logger,
   Req,
 } from '@nestjs/common';
@@ -12,15 +11,10 @@ import {
   mcqRequestSchema,
   summaryRequestSchema,
 } from './dto/ai-request.dto';
-import type {
-  EssayRequestDto,
-  McqRequestDto,
-  SummaryRequestDto,
-} from './dto/ai-request.dto';
-import { ZodValidationPipe } from './pipes/zod-validation.pipe';
 import type { FastifyRequest } from 'fastify';
 import type { MultipartFile } from '@fastify/multipart';
 import type { UploadedFile } from './interfaces/uploaded-file.interface';
+import type { ZodType } from 'zod';
 
 @Controller('api')
 export class AiController {
@@ -29,12 +23,12 @@ export class AiController {
   constructor(private readonly aiService: AiService) {}
 
   @Post('mcq')
-  async generateMcq(
-    @Req() request: FastifyRequest,
-    @Body(new ZodValidationPipe(mcqRequestSchema)) body: McqRequestDto,
-  ) {
+  async generateMcq(@Req() request: FastifyRequest) {
+    const { body, file } = await this.extractMultipartPayload(
+      request,
+      mcqRequestSchema,
+    );
     this.logger.log(`Received MCQ Request for Job ID: ${body.job_id}`);
-    const file = await this.extractUploadedFile(request);
 
     void this.aiService.processJob(
       body.job_id,
@@ -55,12 +49,12 @@ export class AiController {
   }
 
   @Post('essay')
-  async generateEssay(
-    @Req() request: FastifyRequest,
-    @Body(new ZodValidationPipe(essayRequestSchema)) body: EssayRequestDto,
-  ) {
+  async generateEssay(@Req() request: FastifyRequest) {
+    const { body, file } = await this.extractMultipartPayload(
+      request,
+      essayRequestSchema,
+    );
     this.logger.log(`Received Essay Request for Job ID: ${body.job_id}`);
-    const file = await this.extractUploadedFile(request);
 
     void this.aiService.processJob(
       body.job_id,
@@ -81,12 +75,12 @@ export class AiController {
   }
 
   @Post('summary')
-  async generateSummary(
-    @Req() request: FastifyRequest,
-    @Body(new ZodValidationPipe(summaryRequestSchema)) body: SummaryRequestDto,
-  ) {
+  async generateSummary(@Req() request: FastifyRequest) {
+    const { body, file } = await this.extractMultipartPayload(
+      request,
+      summaryRequestSchema,
+    );
     this.logger.log(`Received Summary Request for Job ID: ${body.job_id}`);
-    const file = await this.extractUploadedFile(request);
 
     void this.aiService.processJob(
       body.job_id,
@@ -106,27 +100,55 @@ export class AiController {
     };
   }
 
-  private async extractUploadedFile(request: FastifyRequest): Promise<UploadedFile> {
-    const multipartRequest = request as FastifyRequest & {
-      file: () => Promise<MultipartFile | undefined>;
-    };
-
-    if (typeof multipartRequest.file !== 'function') {
+  private async extractMultipartPayload<TBody>(
+    request: FastifyRequest,
+    schema: ZodType<TBody>,
+  ): Promise<{ body: TBody; file: UploadedFile }> {
+    if (typeof request.parts !== 'function') {
       throw new BadRequestException('Expected multipart/form-data request.');
     }
 
-    const file = await multipartRequest.file();
-    if (!file) {
+    const fields: Record<string, unknown> = {};
+    let uploadedFile: UploadedFile | null = null;
+
+    for await (const part of request.parts()) {
+      if (part.type === 'field') {
+        fields[part.fieldname] = part.value;
+        continue;
+      }
+
+      if (uploadedFile) {
+        await part.toBuffer();
+        throw new BadRequestException('Only one file field is supported.');
+      }
+
+      const filePart = part as MultipartFile;
+      const buffer = await filePart.toBuffer();
+      uploadedFile = {
+        buffer,
+        mimetype: filePart.mimetype,
+        originalname: filePart.filename,
+        size: buffer.length,
+      };
+    }
+
+    if (!uploadedFile) {
       throw new BadRequestException('Missing file field.');
     }
 
-    const buffer = await file.toBuffer();
+    const parsed = schema.safeParse(fields);
+    if (!parsed.success) {
+      throw new BadRequestException({
+        success: false,
+        error: 'validation_error',
+        message: 'Invalid request body.',
+        details: parsed.error.flatten(),
+      });
+    }
 
     return {
-      buffer,
-      mimetype: file.mimetype,
-      originalname: file.filename,
-      size: buffer.length,
+      body: parsed.data,
+      file: uploadedFile,
     };
   }
 }
